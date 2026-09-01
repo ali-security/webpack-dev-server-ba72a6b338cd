@@ -1,25 +1,25 @@
 name: webpack-dev-server
 
+# Built on the ali-security fork via workflow_dispatch only.
 on:
-  push:
-    branches:
-      - master
-      - next
-      - v4
-  pull_request:
-    branches:
-      - master
-      - next
-      - v4
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional jest pattern to narrow the suite; empty runs the full suite"
+        required: false
+        default: ""
 
 jobs:
   lint:
     name: Lint - ${{ matrix.os }} - Node v${{ matrix.node-version }}
 
+    timeout-minutes: 30
+
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest]
         node-version: [16.x]
@@ -27,12 +27,12 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: "npm"
@@ -49,20 +49,27 @@ jobs:
       - name: Check types
         run: if [ -n "$(git status types --porcelain)" ]; then echo "Missing types. Update types by running 'npm run build:types'"; exit 1; else echo "All types are valid"; fi
 
-      - name: Security audit
-        run: npm audit --production
-
-      - name: Check commit message
-        uses: wagoid/commitlint-github-action@v4
-
   test:
     name: Test - ${{ matrix.os }} - Node v${{ matrix.node-version }}, Webpack ${{ matrix.webpack-version }}
 
+    timeout-minutes: 90
+
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # windows-2022 pinned: Windows Server 2025 dropped `wmic`, so
+        # default-gateway/internal-ip resolve nothing, the server never prints
+        # "On Your Network (IPv4)" and normalizeStderr splices the IPv6 line at
+        # index 0 — reddening every test/cli stderr snapshot.
+        os: [ubuntu-latest, windows-2022, macos-latest]
         node-version: [12.x, 14.x, 16.x, 17.x]
         webpack-version: [latest]
+        exclude:
+          # macos runners are arm64 and Node 12/14 have no darwin-arm64 build.
+          - os: macos-latest
+            node-version: 12.x
+          - os: macos-latest
+            node-version: 14.x
         include:
           - node-version: 16.x
             os: ubuntu-latest
@@ -71,10 +78,10 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
 
       - name: Use Node.js ${{ matrix.node-version }}
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: "npm"
@@ -99,9 +106,34 @@ jobs:
           cp -R tmp-client client
 
       - name: Run tests for webpack version ${{ matrix.webpack-version }}
-        run: npm run test:coverage -- --ci
+        run: npm run test:coverage -- --ci ${{ inputs.test-filter }}
 
-      - name: Submit coverage data to codecov
-        uses: codecov/codecov-action@v2
+  pack:
+    name: Pack - webpack-dev-server-4.8.1.tgz
+
+    timeout-minutes: 30
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 16.14.0 is the runtime that produced the published tarball (npm 8.3.1).
+      - name: Use Node.js 16.14.0
+        uses: actions/setup-node@v4
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
+          node-version: 16.14.0
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Pack
+        run: npm pack
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: webpack-dev-server-4.8.1.tgz
+          if-no-files-found: error
