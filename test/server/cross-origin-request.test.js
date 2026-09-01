@@ -320,3 +320,74 @@ describe("cross-site request forgery on state-changing endpoints", () => {
     expect(response.status).toBe(200);
   });
 });
+
+// The header values below make the deprecated 'url.parse()' either return a
+// bogus hostname or throw outright, and a throw escaping the request/upgrade
+// handlers used to take down the whole dev server process.
+// "[::1" is the invalid IPv6 literal from the report; a soft hyphen is dropped
+// entirely by the IDNA mapping, which is what makes 'url.parse()' throw on
+// Node.js >= 17.
+const malformedHosts = [
+  { label: "an invalid IPv6 literal", value: "[::1" },
+  { label: "a soft hyphen", value: "\u00AD" },
+];
+
+describe("malformed 'Host'/'Origin' headers", () => {
+  let compiler;
+  let server;
+
+  beforeAll(async () => {
+    compiler = webpack(config);
+    server = new Server({ port }, compiler);
+
+    await server.start();
+  });
+
+  afterAll(async () => {
+    await server.stop();
+  });
+
+  malformedHosts.forEach(({ label, value }) => {
+    it(`should block a request with ${label} as the 'Host' header`, async () => {
+      const response = await request(server.app)
+        .get("/main.js")
+        .set("Host", value);
+
+      expect(response.status).toBe(200);
+      expect(response.text).toBe("Invalid Host header");
+    });
+
+    it(`should keep serving after ${label} was sent as the 'Host' header`, async () => {
+      await request(server.app).get("/main.js").set("Host", value);
+
+      const response = await request(server.app).get("/main.js");
+
+      expect(response.status).toBe(200);
+    });
+
+    it(`should reject ${label} as the 'Host' header in 'checkHeader'`, () => {
+      const headers = { host: value };
+
+      expect(server.checkHeader(headers, "host", true)).toBe(false);
+    });
+
+    it(`should reject ${label} as the 'Origin' header in 'checkHeader'`, () => {
+      const headers = { origin: `http://${value}/` };
+
+      expect(server.checkHeader(headers, "origin", false)).toBe(false);
+    });
+
+    it(`should reject ${label} as the 'Origin' header in 'isSameOrigin'`, () => {
+      const origin = `http://${value}/`;
+      const headers = { origin, host: `localhost:${port}` };
+
+      expect(server.isSameOrigin(headers)).toBe(false);
+    });
+
+    it(`should reject ${label} as the 'Host' header in 'isSameOrigin'`, () => {
+      const headers = { origin: "http://localhost", host: value };
+
+      expect(server.isSameOrigin(headers)).toBe(false);
+    });
+  });
+});

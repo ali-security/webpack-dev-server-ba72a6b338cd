@@ -476,3 +476,120 @@ describe("cross-site request forgery on state-changing endpoints", () => {
     expect(res.status).toBe(200);
   });
 });
+
+// The header values below make the deprecated `url.parse()` either return a
+// bogus hostname or throw outright, and a throw escaping the upgrade/request
+// handlers used to take down the whole dev server process.
+// "[::1" is the invalid IPv6 literal from the report; a soft hyphen is dropped
+// entirely by the IDNA mapping, which is what makes `url.parse()` throw on
+// Node.js >= 17. Both stay inside latin-1 so they survive an HTTP header.
+const malformedHosts = [
+  { label: "an invalid IPv6 literal", value: "[::1" },
+  { label: "a soft hyphen", value: "\u00AD" },
+];
+
+describe("malformed Host/Origin headers", () => {
+  const devServerPort = port1;
+  const baseURL = `http://localhost:${devServerPort}`;
+
+  let server;
+
+  beforeEach(async () => {
+    const compiler = webpack(config);
+
+    server = new Server(
+      { port: devServerPort, allowedHosts: "auto" },
+      compiler
+    );
+
+    await server.start();
+  });
+
+  afterEach(async () => {
+    if (server) {
+      await server.stop();
+      // Allow the port to be fully released before the next test
+      await new Promise((resolve) => {
+        setTimeout(resolve, 100);
+      });
+      server = null;
+    }
+  });
+
+  // The server must still be alive: a normal request still succeeds.
+  function requestStatus(path) {
+    const http = require("http");
+
+    return new Promise((resolve, reject) => {
+      const req = http.get(`${baseURL}${path}`, (res) => {
+        res.resume();
+        resolve(res.statusCode);
+      });
+
+      req.on("error", reject);
+    });
+  }
+
+  // Sends the request over a raw socket so the malformed value reaches the
+  // server exactly as written.
+  function rawRequest(hostHeader) {
+    const net = require("net");
+
+    return new Promise((resolve) => {
+      let response = "";
+
+      const socket = net.connect(devServerPort, "127.0.0.1", () => {
+        socket.write(
+          [
+            "GET /main.js HTTP/1.1",
+            `Host: ${hostHeader}`,
+            "Connection: close",
+            "",
+            "",
+          ].join("\r\n"),
+          "latin1"
+        );
+      });
+
+      socket.setEncoding("latin1");
+      socket.on("data", (chunk) => {
+        response += chunk;
+      });
+      socket.on("close", () => resolve(response));
+      socket.on("error", () => resolve(response));
+    });
+  }
+
+  malformedHosts.forEach(({ label, value }) => {
+    it(`should reject a WebSocket upgrade sending ${label} as the 'Origin' header without crashing`, async () => {
+      const WebSocket = require("ws");
+
+      await new Promise((resolve) => {
+        const ws = new WebSocket(`ws://localhost:${devServerPort}/ws`, {
+          headers: {
+            host: `localhost:${devServerPort}`,
+            origin: `http://${value}/`,
+          },
+        });
+
+        ws.on("close", resolve);
+        ws.on("error", resolve);
+      });
+
+      const status = await requestStatus("/main.js");
+
+      expect(status).toBe(200);
+    });
+
+    it(`should reject a request sending ${label} as the 'Host' header without crashing`, async () => {
+      const response = await rawRequest(value);
+
+      expect(response).toContain("HTTP/1.1 200");
+      expect(response).toContain("Invalid Host header");
+
+      const status = await requestStatus("/main.js");
+
+      expect(status).toBe(200);
+    });
+  });
+});
