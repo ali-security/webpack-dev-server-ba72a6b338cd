@@ -1,5 +1,6 @@
 "use strict";
 
+const http = require("http");
 const path = require("path");
 const request = require("supertest");
 const express = require("express");
@@ -9,6 +10,7 @@ const webpack = require("webpack");
 const Server = require("../../lib/Server");
 const config = require("../fixtures/proxy-config/webpack.config");
 const [port1, port2, port3, port4] = require("../ports-map")["proxy-option"];
+const [port5, port6] = require("../ports-map")["proxy-option-hmr"];
 
 const WebSocketServer = WebSocket.Server;
 const staticDirectory = path.resolve(__dirname, "../fixtures/proxy-config");
@@ -597,6 +599,512 @@ describe("proxy option", () => {
 
           await server.stop();
         });
+      });
+    });
+  });
+
+  describe("should not silently proxy the dev server web socket", () => {
+    let server;
+    let backend;
+    let backendWebSocketServer;
+    let backendSockets;
+    let backendUpgradeCount;
+
+    const BACKEND_MESSAGE_TYPE = "backend-message";
+
+    beforeAll(async () => {
+      backendUpgradeCount = 0;
+      backendSockets = [];
+
+      backend = http.createServer((req, res) => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("from backend");
+      });
+      backend.on("connection", (socket) => {
+        backendSockets.push(socket);
+      });
+
+      backendWebSocketServer = new WebSocketServer({ server: backend });
+      backendWebSocketServer.on("connection", (connection) => {
+        backendUpgradeCount += 1;
+
+        connection.send(JSON.stringify({ type: BACKEND_MESSAGE_TYPE }));
+      });
+
+      await new Promise((resolve) => {
+        backend.listen(port6, resolve);
+      });
+
+      const compiler = webpack(config);
+
+      server = new Server(
+        {
+          hot: true,
+          allowedHosts: "all",
+          webSocketServer: "ws",
+          proxy: [
+            {
+              context: "/",
+              target: `http://localhost:${port6}`,
+              ws: true,
+            },
+          ],
+          port: port5,
+        },
+        compiler
+      );
+
+      await server.start();
+    });
+
+    afterAll(async () => {
+      for (const client of backendWebSocketServer.clients) {
+        client.terminate();
+      }
+
+      backendWebSocketServer.close();
+
+      // Force-drop any lingering proxy-opened sockets so `backend.close()` does
+      // not hang when the fix is missing and the proxy is mid-upgrade.
+      backendSockets.forEach((socket) => {
+        socket.destroy();
+      });
+
+      await server.stop();
+
+      await new Promise((resolve) => {
+        backend.close(resolve);
+      });
+    });
+
+    it("delivers the HMR messages and never reaches the proxy target", async () => {
+      const messages = [];
+      const ws = new WebSocket(`ws://localhost:${port5}/ws`);
+
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 10000);
+
+        ws.on("message", (raw) => {
+          const parsed = JSON.parse(raw.toString());
+
+          messages.push(parsed);
+
+          if (parsed.type === "hot") {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+
+        ws.on("error", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+
+      ws.close();
+
+      // Let the proxy finish its async forwarding so the assertions below see
+      // the upgrade attempt deterministically.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 1000);
+      });
+
+      expect(messages.some((m) => m.type === "hot")).toBe(true);
+      expect(messages.some((m) => m.type === BACKEND_MESSAGE_TYPE)).toBe(false);
+      expect(backendUpgradeCount).toBe(0);
+    });
+  });
+
+  describe("should not report proxy errors for the dev server web socket", () => {
+    let server;
+    let backend;
+    let backendSockets;
+    let backendUpgradeAttempts;
+    let consoleSpies;
+
+    beforeAll(async () => {
+      backendUpgradeAttempts = 0;
+      backendSockets = [];
+
+      backend = http.createServer((req, res) => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("from backend");
+      });
+      backend.on("connection", (socket) => {
+        backendSockets.push(socket);
+      });
+      // A hostile proxy target: every upgrade forwarded to it is dropped.
+      backend.on("upgrade", (req, socket) => {
+        backendUpgradeAttempts += 1;
+
+        socket.destroy();
+      });
+
+      await new Promise((resolve) => {
+        backend.listen(port6, resolve);
+      });
+
+      const compiler = webpack(config);
+
+      server = new Server(
+        {
+          hot: true,
+          allowedHosts: "all",
+          webSocketServer: "ws",
+          proxy: [
+            {
+              context: "/",
+              target: `http://localhost:${port6}`,
+              ws: true,
+            },
+          ],
+          port: port5,
+        },
+        compiler
+      );
+
+      await server.start();
+
+      // Spied on after `start()`, otherwise the "[HPM] Proxy created" line
+      // emitted while the middlewares are set up would be counted.
+      consoleSpies = ["error", "warn", "info", "log"].map((method) =>
+        jest.spyOn(console, method).mockImplementation(() => true)
+      );
+    });
+
+    afterAll(async () => {
+      consoleSpies.forEach((spy) => {
+        spy.mockRestore();
+      });
+
+      backendSockets.forEach((socket) => {
+        socket.destroy();
+      });
+
+      await server.stop();
+
+      await new Promise((resolve) => {
+        backend.close(resolve);
+      });
+    });
+
+    it("does not surface any [HPM] output when the HMR client connects", async () => {
+      const messages = [];
+      const ws = new WebSocket(`ws://localhost:${port5}/ws`);
+
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 10000);
+
+        ws.on("message", (raw) => {
+          const parsed = JSON.parse(raw.toString());
+
+          messages.push(parsed);
+
+          if (parsed.type === "hot") {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+
+        ws.on("error", () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+
+      ws.close();
+
+      await new Promise((resolve) => {
+        setTimeout(resolve, 1000);
+      });
+
+      const hpmOutput = [];
+
+      consoleSpies.forEach((spy) => {
+        spy.mock.calls.forEach((args) => {
+          const line = args.join(" ");
+
+          if (line.includes("[HPM]")) {
+            hpmOutput.push(line);
+          }
+        });
+      });
+
+      expect(backendUpgradeAttempts).toBe(0);
+      expect(hpmOutput).toEqual([]);
+      expect(messages.some((m) => m.type === "hot")).toBe(true);
+    });
+  });
+
+  describe("HMR upgrade dispatching to user proxies", () => {
+    let server;
+    let backend;
+    let backendWebSocketServer;
+    let backendSockets;
+    let backendUpgradeCount;
+
+    // Start a backend WebSocket server (the user proxy target) and a dev server
+    // proxying everything to it, with the given dev server options merged in.
+    const setup = async (devServerOptions) => {
+      backendUpgradeCount = 0;
+      backendSockets = [];
+
+      backend = http.createServer((req, res) => {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("from backend");
+      });
+      backend.on("connection", (socket) => {
+        backendSockets.push(socket);
+      });
+
+      backendWebSocketServer = new WebSocketServer({ server: backend });
+      backendWebSocketServer.on("connection", () => {
+        backendUpgradeCount += 1;
+      });
+
+      await new Promise((resolve) => {
+        backend.listen(port6, resolve);
+      });
+
+      server = new Server(
+        {
+          hot: true,
+          allowedHosts: "all",
+          proxy: [
+            {
+              context: "/",
+              target: `http://localhost:${port6}`,
+              ws: true,
+            },
+          ],
+          port: port5,
+          ...devServerOptions,
+        },
+        webpack(config)
+      );
+
+      await server.start();
+    };
+
+    const teardown = async () => {
+      for (const client of backendWebSocketServer.clients) {
+        client.terminate();
+      }
+
+      backendWebSocketServer.close();
+
+      backendSockets.forEach((socket) => {
+        socket.destroy();
+      });
+
+      await server.stop();
+
+      await new Promise((resolve) => {
+        backend.close(resolve);
+      });
+    };
+
+    // Open a WebSocket to `urlPath` and report whether the dev server completed
+    // the handshake (`opened`) and whether the upgrade was forwarded to the
+    // user proxy target (`forwarded`).
+    const probe = async (urlPath) => {
+      const before = backendUpgradeCount;
+      const ws = new WebSocket(`ws://localhost:${port5}${urlPath}`);
+
+      // Resolve as soon as the socket reaches a terminal state instead of
+      // waiting a fixed delay: `open` means the handshake completed, `error`
+      // means it was rejected. The timeout is only a fallback in case neither
+      // event ever fires.
+      const opened = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(false), 10000);
+
+        ws.on("open", () => {
+          clearTimeout(timer);
+          resolve(true);
+        });
+
+        ws.on("error", () => {
+          clearTimeout(timer);
+          resolve(false);
+        });
+      });
+
+      // A proxy forwards the upgrade asynchronously and the dev server can
+      // complete the handshake before that forwarding reaches the target, so
+      // let it settle before deciding whether the proxy was involved.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 1000);
+      });
+
+      ws.close();
+
+      return { opened, forwarded: backendUpgradeCount > before };
+    };
+
+    // Send a plain HTTP request to the dev server and collect the response.
+    const sendHttpRequest = (urlPath) => {
+      const url = `http://localhost:${port5}${urlPath}`;
+
+      return new Promise((resolve, reject) => {
+        const httpRequest = http.get(url, (res) => {
+          let body = "";
+
+          res.setEncoding("utf8");
+          res.on("data", (chunk) => {
+            body += chunk;
+          });
+          res.on("end", () => {
+            resolve({ status: res.statusCode, body });
+          });
+        });
+
+        httpRequest.on("error", reject);
+      });
+    };
+
+    // Behavior shared by every web socket server implementation: the HMR socket
+    // is served locally and never forwarded, while any path the HMR server does
+    // not own falls through to the user proxy. SockJS serves its transport
+    // under `/<prefix>/<server>/<session>/websocket`, not the bare `/ws`.
+    const serverTypes = [
+      { type: "ws", hmrPath: "/ws", nonHmrPath: "/not-hmr" },
+      {
+        type: "sockjs",
+        hmrPath: "/ws/000/abcd1234/websocket",
+        nonHmrPath: "/not-hmr",
+      },
+    ];
+
+    serverTypes.forEach(({ type, hmrPath, nonHmrPath }) => {
+      describe(`with webSocketServer: ${type}`, () => {
+        beforeAll(async () => {
+          await setup({ webSocketServer: type });
+        });
+
+        afterAll(async () => {
+          await teardown();
+        });
+
+        it("serves the HMR upgrade locally and does not forward it", async () => {
+          const { opened, forwarded } = await probe(hmrPath);
+
+          expect(opened).toBe(true);
+          expect(forwarded).toBe(false);
+        });
+
+        it("forwards a non-HMR upgrade to the user proxy", async () => {
+          const { forwarded } = await probe(nonHmrPath);
+
+          expect(forwarded).toBe(true);
+        });
+      });
+    });
+
+    // `ws`-specific: the dispatch compares the path exactly the same way
+    // `WebSocketServer#shouldHandle` does, so only the configured path (query
+    // stripped) is the HMR socket; every other variant is forwarded.
+    describe("with the `ws` server, path matching is exact", () => {
+      beforeAll(async () => {
+        await setup({ webSocketServer: "ws" });
+      });
+
+      afterAll(async () => {
+        await teardown();
+      });
+
+      it.each([
+        ["exact path", "/ws"],
+        ["path with query string", "/ws?token=1"],
+      ])("treats %s (%s) as the HMR upgrade path", async (_label, urlPath) => {
+        const { forwarded } = await probe(urlPath);
+
+        expect(forwarded).toBe(false);
+      });
+
+      it.each([
+        ["leading double slash", "//ws"],
+        ["trailing slash", "/ws/"],
+        ["uppercase", "/WS"],
+        ["mixed case", "/wS"],
+        ["percent-encoded path", "/%77%73"],
+      ])("forwards %s (%s) to the user proxy", async (_label, urlPath) => {
+        const { forwarded } = await probe(urlPath);
+
+        expect(forwarded).toBe(true);
+      });
+    });
+
+    // The HMR path is read from the configured `webSocketServer` options, not a
+    // hardcoded `/ws`.
+    describe("with a custom `ws` path", () => {
+      beforeAll(async () => {
+        await setup({
+          webSocketServer: { type: "ws", options: { path: "/custom-hmr" } },
+        });
+      });
+
+      afterAll(async () => {
+        await teardown();
+      });
+
+      it("treats the configured path as the HMR upgrade path", async () => {
+        const { forwarded } = await probe("/custom-hmr");
+
+        expect(forwarded).toBe(false);
+      });
+
+      it("forwards /ws once it is no longer the HMR path", async () => {
+        const { forwarded } = await probe("/ws");
+
+        expect(forwarded).toBe(true);
+      });
+    });
+
+    // `http-proxy-middleware` subscribes to the server's "upgrade" event by
+    // itself once a request has passed through it, and such a subscription
+    // would forward the dev server web socket without ever consulting the
+    // filtered handler.
+    describe("after a request has passed through the user proxy", () => {
+      beforeAll(async () => {
+        await setup({ webSocketServer: "ws" });
+      });
+
+      afterAll(async () => {
+        await teardown();
+      });
+
+      it("still serves the HMR upgrade locally", async () => {
+        const response = await sendHttpRequest("/proxied-request");
+
+        expect(response.status).toBe(200);
+        expect(response.body).toContain("from backend");
+
+        const { opened, forwarded } = await probe("/ws");
+
+        expect(opened).toBe(true);
+        expect(forwarded).toBe(false);
+      });
+    });
+
+    // With no HMR server there is no socket to protect, so the filter never
+    // engages and even `/ws` is forwarded to the user proxy.
+    describe("without a webSocketServer", () => {
+      beforeAll(async () => {
+        await setup({
+          hot: false,
+          liveReload: false,
+          webSocketServer: false,
+        });
+      });
+
+      afterAll(async () => {
+        await teardown();
+      });
+
+      it("forwards /ws to the user proxy", async () => {
+        const { forwarded } = await probe("/ws");
+
+        expect(forwarded).toBe(true);
       });
     });
   });
