@@ -239,3 +239,84 @@ describe("cross-origin resource policy header", () => {
     expect(res.headers["cross-origin-resource-policy"]).toBe("same-origin");
   });
 });
+
+// The built-in state-changing route is registered before the cross-origin
+// middleware, so it needs its own check: any visited page could otherwise
+// force endless rebuilds with a plain GET.
+// @see https://github.com/webpack/webpack-dev-server/security/advisories/GHSA-f5vj-f2hx-8m93
+describe("cross-site request forgery on state-changing endpoints", () => {
+  const endpoint = "/webpack-dev-server/invalidate";
+
+  let compiler;
+  let server;
+
+  beforeAll(async () => {
+    compiler = webpack(config);
+    server = new Server({ port }, compiler);
+
+    await server.start();
+  });
+
+  afterAll(async () => {
+    await server.stop();
+  });
+
+  it("should block a cross-site cors request", async () => {
+    const response = await request(server.app)
+      .get(endpoint)
+      .set("Sec-Fetch-Mode", "cors")
+      .set("Sec-Fetch-Site", "cross-site");
+
+    expect(response.status).toBe(403);
+    expect(response.text).toBe("Cross-Origin request blocked");
+  });
+
+  it("should block a cross-site no-cors request", async () => {
+    const response = await request(server.app)
+      .get(endpoint)
+      .set("Sec-Fetch-Mode", "no-cors")
+      .set("Sec-Fetch-Site", "cross-site");
+
+    expect(response.status).toBe(403);
+  });
+
+  it("should block a same-site request", async () => {
+    const response = await request(server.app)
+      .get(endpoint)
+      .set("Sec-Fetch-Mode", "cors")
+      .set("Sec-Fetch-Site", "same-site");
+
+    expect(response.status).toBe(403);
+  });
+
+  it("should block a request with a cross-origin 'Origin' and no 'Sec-Fetch-*' headers", async () => {
+    const response = await request(server.app)
+      .get(endpoint)
+      .set("Origin", "http://evil.example");
+
+    expect(response.status).toBe(403);
+  });
+
+  it("should allow a same-origin request", async () => {
+    const response = await request(server.app)
+      .get(endpoint)
+      .set("Sec-Fetch-Mode", "cors")
+      .set("Sec-Fetch-Site", "same-origin");
+
+    expect(response.status).toBe(200);
+  });
+
+  it("should allow a user-initiated navigation", async () => {
+    const response = await request(server.app)
+      .get(endpoint)
+      .set("Sec-Fetch-Site", "none");
+
+    expect(response.status).toBe(200);
+  });
+
+  it("should allow a request without 'Sec-Fetch-*' headers or 'Origin' (e.g. curl)", async () => {
+    const response = await request(server.app).get(endpoint);
+
+    expect(response.status).toBe(200);
+  });
+});

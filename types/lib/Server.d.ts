@@ -3169,6 +3169,14 @@ declare class Server {
    */
   private isSameOrigin;
   /**
+   * Determines whether a request was initiated from the dev server's own
+   * origin, to reject cross-site request forgery on state-changing endpoints.
+   * @private
+   * @param {Request} req
+   * @returns {boolean}
+   */
+  private isSameOriginRequest;
+  /**
    * @param {ClientConnection[]} clients
    * @param {string} type
    * @param {any} [data]
