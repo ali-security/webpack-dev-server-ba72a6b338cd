@@ -149,3 +149,93 @@ describe("cross-origin request check", () => {
     });
   });
 });
+
+// Browsers only send the "Sec-Fetch-*" headers from potentially trustworthy
+// origins, so a plain HTTP dev server needs the "Cross-Origin-Resource-Policy"
+// header to block cross-origin embedding of the bundle.
+// @see https://github.com/webpack/webpack-dev-server/security/advisories/GHSA-79cf-xcqc-c78w
+describe("cross-origin resource policy header", () => {
+  let server;
+
+  afterEach(async () => {
+    if (server) {
+      await server.stop();
+      // Allow the port to be fully released before the next test
+      await new Promise((resolve) => {
+        setTimeout(resolve, 100);
+      });
+      server = null;
+    }
+  });
+
+  const getResponse = async (options) => {
+    const compiler = webpack(config);
+
+    server = new Server(options, compiler);
+
+    await server.start();
+
+    return request(server.app).get("/main.js");
+  };
+
+  it("should be set by default", async () => {
+    const res = await getResponse({ port });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cross-origin-resource-policy"]).toBe("same-origin");
+  });
+
+  it('should not be set with the "all" "allowedHosts" value', async () => {
+    const res = await getResponse({ port, allowedHosts: "all" });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cross-origin-resource-policy"]).toBeUndefined();
+  });
+
+  it("should not be set with an explicitly allowed host", async () => {
+    const res = await getResponse({ port, allowedHosts: ["127.0.0.1"] });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cross-origin-resource-policy"]).toBeUndefined();
+  });
+
+  it("should not be set with a wildcard CORS header", async () => {
+    const res = await getResponse({
+      port,
+      headers: { "Access-Control-Allow-Origin": "*" },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cross-origin-resource-policy"]).toBeUndefined();
+  });
+
+  it("should not be set with a wildcard CORS header in an array", async () => {
+    const res = await getResponse({
+      port,
+      headers: [{ key: "Access-Control-Allow-Origin", value: "*" }],
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cross-origin-resource-policy"]).toBeUndefined();
+  });
+
+  it("should be set with a specific origin CORS header", async () => {
+    const res = await getResponse({
+      port,
+      headers: { "Access-Control-Allow-Origin": "http://example.com" },
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cross-origin-resource-policy"]).toBe("same-origin");
+  });
+
+  it("should be set with a function returning a wildcard CORS header", async () => {
+    const res = await getResponse({
+      port,
+      headers: () => [{ key: "Access-Control-Allow-Origin", value: "*" }],
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.headers["cross-origin-resource-policy"]).toBe("same-origin");
+  });
+});
