@@ -3152,6 +3152,7 @@ declare class Server {
    * @param {{ [key: string]: string | undefined }} headers
    * @param {string} headerToCheck
    * @param {boolean} allowIP
+   * @param {boolean} [validateHost]
    * @returns {boolean}
    */
   private checkHeader;

@@ -79,6 +79,8 @@ const listOfTests = {
   "server-option": 1,
   "normalize-option": 1,
   "setup-middlewares-option": 1,
+  "cross-origin-request": 2,
+  "cross-origin-request-server": 1,
 };
 
 let startPort = 8089;
